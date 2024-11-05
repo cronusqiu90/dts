@@ -155,6 +155,11 @@ func startRpcRequestService() error {
 		return err
 	}
 
+	ntfCh := ch.NotifyPublish(make(chan amqp091.Confirmation, 1))
+	defer close(ntfCh)
+	rtnCh := ch.NotifyReturn(make(chan amqp091.Return, 1))
+	defer close(rtnCh)
+
 	corrId := uuid.New().String()
 	body, err := newRequest(corrId)
 	if err != nil {
@@ -186,71 +191,85 @@ func startRpcRequestService() error {
 	); err != nil {
 		return err
 	}
-	log.Infof("[%s] REQUEST(%s) sent", corrId, string(body))
+	log.Infof("[%s] %s", corrId, string(body))
+	select {
+	case <-isClosed:
+		return nil
 
-	tick := time.NewTicker(5 * time.Minute)
-	defer tick.Stop()
-	for {
-		select {
-		case <-isClosed:
+	case <-time.After(30 * time.Second):
+		return fmt.Errorf("[%s] failed to deliver request, timeout", corrId)
+
+	case ntf := <-ntfCh:
+		if !ntf.Ack {
+			return fmt.Errorf("[%s] failed to deliver request, nacked", corrId)
+		}
+
+		log.Infof("[%s] request deliver succeeded", corrId)
+		break
+	case rtn := <-rtnCh:
+		return fmt.Errorf("[%s] failed to deliver request, code=%d, err=%s", corrId, rtn.ReplyCode, rtn.ReplyText)
+	}
+
+	select {
+	case <-isClosed:
+		return nil
+
+	case <-time.After(120 * time.Second):
+		return fmt.Errorf("[%s] wait for response timeout", corrId)
+
+	case msg, ok := <-msgs:
+		if !ok {
 			return nil
-		case <-tick.C:
-			log.Warn("wait for response timeout")
-			return nil
-		case msg, ok := <-msgs:
-			if !ok {
-				return nil
+		}
+		if msg.DeliveryTag == 0 {
+			return errors.New("invalid delivery tag")
+		}
+		if corrId == msg.CorrelationId {
+			var resp message.Response
+			if err := json.Unmarshal(msg.Body, &resp); err != nil {
+				return err
 			}
-			if msg.DeliveryTag == 0 {
-				return errors.New("invalid delivery tag")
-			}
-			if corrId == msg.CorrelationId {
-				var resp message.Response
-				if err := json.Unmarshal(msg.Body, &resp); err != nil {
-					return err
-				}
 
-				switch resp.Status {
-				case "FAILURE":
-					return fmt.Errorf("[%s] FAILURE:%v", corrId, resp.Traceback)
-				case "IGNORED":
-					return fmt.Errorf("[%s] IGNORED", corrId)
-				case "STARTED":
-					log.Infof("[%s] STARTED", corrId)
-				case "SUCCESS":
-					log.Infof("[%s] SUCCESS", corrId)
-					var r message.Result
+			switch resp.Status {
+			case "FAILURE":
+				return fmt.Errorf("[%s] FAILURE:%v", corrId, resp.Traceback)
+			case "IGNORED":
+				return fmt.Errorf("[%s] IGNORED", corrId)
+			case "STARTED":
+				log.Infof("[%s] STARTED", corrId)
+			case "SUCCESS":
+				var r message.Result
 
-					if raw, err := json.Marshal(resp.Result); err != nil {
+				if raw, err := json.Marshal(resp.Result); err != nil {
+					return fmt.Errorf("[%s] %v", corrId, err)
+				} else {
+					if err := json.Unmarshal(raw, &r); err != nil {
 						return fmt.Errorf("[%s] %v", corrId, err)
-					} else {
-						if err := json.Unmarshal(raw, &r); err != nil {
-							return fmt.Errorf("[%s] %v", corrId, err)
-						}
-					}
-
-					if r.Code != 200 {
-						return fmt.Errorf("[%s] %v", corrId, r)
-					}
-
-					if r.Tasks == nil || len(r.Tasks) == 0 {
-						return fmt.Errorf("[%s] no available tasks", corrId)
-					}
-
-					total := len(r.Tasks)
-					for index, task := range r.Tasks {
-						if err := handleTask(task); err != nil {
-							log.Errorf("[%d/%d] failed to handle Task(task_id=%s): %v", index+1, total, task.TaskID, err)
-							continue
-						}
-						log.Infof("[%d/%d] Task(task_id=%s) Added", index+1, total, task.TaskID)
 					}
 				}
-				return nil
+
+				if r.Code != 200 {
+					return fmt.Errorf("[%s] %v", corrId, r)
+				}
+
+				if r.Tasks == nil || len(r.Tasks) == 0 {
+					return fmt.Errorf("[%s] no available tasks", corrId)
+				}
+
+				total := len(r.Tasks)
+				for index, task := range r.Tasks {
+					if err := handleTask(task); err != nil {
+						log.Errorf("[%d/%d] failed to handle Task(task_id=%s): %v", index+1, total, task.TaskID, err)
+						continue
+					}
+					log.Infof("[%d/%d] Task(task_id=%s) Added", index+1, total, task.TaskID)
+				}
 			}
+			return nil
 		}
 	}
 
+	return errors.New("unknown error")
 }
 
 func startFeedService() error {
